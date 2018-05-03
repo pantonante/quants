@@ -135,7 +135,3 @@ if __name__ == "__main__":
     print("Downloading ETF details (" + sys.argv[0] + ")...")
     etf = ETFData(sys.argv[1])
     etf.printSummary()
-
-    dump = json.dumps(etf)
-    with open(sys.argv[1]+".json", 'w') as outfile:
-        json.dump(etf, outfile)
