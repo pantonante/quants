@@ -1,0 +1,250 @@
+---
+title: "Optimal Portfolio"
+author: "Pasquale Antonante"
+date: "6/5/2018"
+output:
+  html_document:
+    toc: true
+    theme: sandstone
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+require(pander)
+library(mongolite)
+library(quantmod)
+library(PortfolioAnalytics)
+library(doParallel)
+
+registerDoParallel(cores=4)
+etfs_collection <- mongo(collection = "details", db = "etf")
+```
+
+## Parameters
+
+```{r params}
+# General
+q <- 2 # last q years used for evaluate performances (q<k)
+k <- 5 # last k-q years used for optimization
+risk_free_rate <- .028 / 12 # monthly risk free rate
+risk_aversion <-  0.2 # only used if quadratic utility
+diversification_target <- 0.1 # lower enforce more diversification
+capital <- 800 # in dollars
+search_size <- 10000 # number of random generated portfolios
+
+# Asset allocation
+group_labels <- c("Stock", "Bond") # do not change
+benckmark_weights <- c(0.8,0.2) # how to mix SPY and IEF (iShares 7-10 Year US Bond)
+group_min=c(0.6, 0.2)
+group_max=c(0.8, 0.4)
+```
+
+## Selected ETFs
+
+```{r etfs, echo=FALSE, message=FALSE, warnings=FALSE}
+etfs <- etfs_collection$find( 
+  fields = '{"_id": false, "ticker": true, "asset_class": true, "category": true,"name": true, "expense_ratio":true}',
+  sort = '{"category": 1, "asset_class": 1}')
+etfs$expense_ratio <-etfs$expense_ratio*100
+colnames(etfs) <- c("Ticker", "Name","Category", "Asset class", "Expense Ratio")
+panderOptions('table.split.table', Inf)
+pander(etfs, style = 'rmarkdown')
+```
+
+```{r symbol-download, include=FALSE, message=FALSE, warnings=FALSE, fig.align='center'}
+stock <- etfs_collection$find(query = '{"asset_class":"Equity"}', fields = '{"_id": false, "ticker": true, "expense_ratio":true}')
+bond <- etfs_collection$find(query = '{"asset_class":"Bond"}', fields = '{"_id": false, "ticker": true, "expense_ratio":true}')
+symbols <- c(stock$ticker, bond$ticker)
+expense_ratios <- c(stock$expense_ratio, bond$expense_ratio)
+groups <- list( 1:length(stock$ticker),
+               (1+length(stock$ticker)):(length(stock$ticker)+length(bond$ticker)))
+end_date <- format(Sys.Date() - q*365,"%Y-%m-%d")
+start_date <- format(Sys.Date() - k*365, "%Y-%m-%d")
+returns_list <- lapply(symbols, function(sym) {
+  monthlyReturn(na.omit(Ad(getSymbols(sym, from=start_date, to=end_date, auto.assign=FALSE))))
+})
+returns <- do.call(merge, returns_list)
+colnames(returns) <- symbols
+returns <- sweep(returns,2,expense_ratios/12) # removing monthly expense
+returns[is.na(returns)] <- 0 # if we can't buy it, we can't profit from it
+
+#chart.Correlation(returns, histogram=FALSE, method = 'kendall')
+```
+
+## Portfolio constraint specification
+
+```{r portfolio-spec, message=FALSE, warnings=FALSE}
+############## PORTFOLIO INIT ##############
+
+pspec <- portfolio.spec(symbols)
+
+############## CONSTRAINTS ##############
+
+# The long-only, full-investment constraint
+pspec <- add.constraint(portfolio=pspec, type="weight_sum", min_sum = 0.99, max_sum = 1.01)
+
+# Add box constraints, each investment should not exceed 50%
+pspec <- add.constraint(portfolio=pspec, type="box", min=0.0, max=0.5)
+
+# Add group constraints
+pspec <- add.constraint(portfolio=pspec, type="group",
+                        groups=groups,
+                        group_labels=group_labels,
+                        group_min=group_min,
+                        group_max=group_max)
+
+# Add position limit constraint such that we have a maximum number of three 
+# assets with non-zero weights.
+#pspec <- add.constraint(portfolio=pspec, type="position_limit", max_pos=3)
+
+# Add turnover constraint
+##pspec <- add.constraint(portfolio=pspec, type="turnover", turnover_target=0.2)
+
+# Add target mean return constraint
+#pspec <- add.constraint(portfolio=pspec, type="return", return_target=0.07/12)
+```
+
+
+## Portfolio objective
+
+```{r portfolio-obj, message=FALSE, warnings=FALSE}
+# Min-Var portfolio
+minvar <- add.objective(pspec, type = "return", name = "mean")
+minvar <- add.objective(minvar, type = "risk", name = "var", multiplier = 1)
+
+# Min-Expected Shortfall (or Expected Tail Losses - ETL)
+minetl <- add.objective(portfolio=pspec, type="risk", name="ES")
+minetl <- add.objective(portfolio=minetl, type="return", name="mean")
+
+# Max-Sortino Ration
+sortino <- add.objective(portfolio = pspec, type="return", name="SortinoRatio", enabled=TRUE, arguments = list(MAR=risk_free_rate))
+# multiplier 0 makes it availble for plotting, but not affect optimization
+sortino <- add.objective(portfolio = sortino, type="return", name="mean", enabled=TRUE, multiplier=0) 
+```
+
+## Optimization
+
+```{r portfolio-optimization, message=FALSE, warnings=FALSE}
+minvar.opt <- optimize.portfolio(R = returns,
+                                 optimize_method = "random",
+                                 search_size = search_size,
+                                 portfolio = minvar,
+                                 trace=TRUE, verbose=TRUE)
+
+minetl.opt <- optimize.portfolio(R = returns,
+                                 optimize_method = "random",
+                                 search_size = search_size,
+                                 portfolio = minetl,
+                                 trace=TRUE, verbose=TRUE)
+
+sortino.opt <- optimize.portfolio(R = returns,
+                                  optimize_method = "random",
+                                  search_size = search_size,
+                                  portfolio = sortino,
+                                  trace=TRUE, verbose=TRUE)
+```
+
+
+```{r portfolio-plots, message=FALSE, warnings=FALSE, fig.align='center'}
+plot(minvar.opt, risk.col='StdDev', main="Min-Var")
+plot(minetl.opt, risk.col='ES', main="Min-ES")
+plot(sortino.opt, risk.col='SortinoRatio', main="Max-Sortino")
+```
+
+## Portfolios Weights
+
+```{r portfolio-weights, message=FALSE, warnings=FALSE, fig.align='center'}
+minvar.weights <- extractWeights(minvar.opt)
+minetl.weights <- extractWeights(minetl.opt)
+sortino.weights <- extractWeights(sortino.opt)
+weights <- cbind(minvar.weights,minetl.weights,sortino.weights)
+colnames(weights) <- c("Min-Var", "Min-ES", "Max-Sortino")
+pander(weights, style = 'rmarkdown')
+```
+
+## Performances
+
+```{r portfolio-returns, message=FALSE, warnings=FALSE, fig.align='center'}
+end_date <- format(Sys.Date(),"%Y-%m-%d")
+start_date <- format(Sys.Date() - q*365, "%Y-%m-%d")
+# Benckmark
+SPY <- monthlyReturn(na.omit(Ad(getSymbols("SPY", from=start_date, to=end_date, auto.assign=FALSE))))
+IEF <- monthlyReturn(na.omit(Ad(getSymbols("IEF", from=start_date, to=end_date, auto.assign=FALSE))))
+benckmark <- Return.portfolio(merge(SPY,IEF), weights = benckmark_weights, rebalance_on = "quarters")
+colnames(benckmark) <- "Index"
+colnames(SPY) <- "SPY"
+
+# Getting quotes again returns
+returns_list <- lapply(symbols, function(sym) {
+  monthlyReturn(na.omit(Ad(getSymbols(sym, from=start_date, to=end_date, auto.assign=FALSE))))
+})
+returns <- do.call(merge, returns_list)
+colnames(returns) <- symbols
+returns <- sweep(returns,2,expense_ratios/12) # removing monthly expense
+returns[is.na(returns)] <- 0 # if we can't buy it, we can't profit from it
+
+# Portfolio returns
+minvar.return <- Return.portfolio(returns, weights = minvar.weights, rebalance_on = "quarters")
+colnames(minvar.return) <- "Min-Var"
+minetl.return <- Return.portfolio(returns, weights = minetl.weights, rebalance_on = "quarters")
+colnames(minetl.return) <- "Min-ES"
+sortino.return <- Return.portfolio(returns, weights = sortino.weights, rebalance_on = "quarters")
+colnames(sortino.return) <- "Max-Sortino"
+
+all.in.one <- merge(minvar.return, minetl.return, sortino.return, benckmark, SPY)
+```
+
+### Performance Summary
+```{r portfolio-performance, message=FALSE, warnings=FALSE, fig.align='center'}
+charts.PerformanceSummary(all.in.one, risk_free_rate, main="Cumulative returns", legend.loc= "topleft")
+```
+
+### Risk/Return Scatter
+```{r portfolio-riskreturn, message=FALSE, warnings=FALSE, fig.align='center'}
+chart.RiskReturnScatter(all.in.one, Rf = risk_free_rate, main = "Risk/Return Scatter")
+```
+
+### Capital Asset Pricing Model (CAPM) parameters
+```{r capm, ECHO=FALSE,message=FALSE, warnings=FALSE}
+table <- table.CAPM(merge(minvar.return, minetl.return, sortino.return), 
+                    merge(benckmark,SPY), Rf = risk_free_rate)
+pander(table, style = 'rmarkdown')
+```
+
+- **Alpha:** the degree to which the asset's returns are not explained by the return that could be captured from the market.Can be used to directly measure the value added or subtracted by a portfolio manager
+- **Beta:** describes the portions of the returns of the asset that could be directly attributed to the returns of a passive investment in the benchmark asset (via linear model regression)
+- **TreynorRatio:** ratio of asset's Excess Return to Beta β of the benchmark
+- **ActivePremium:** investment's annualized return minus the benchmark's annualized return
+- **TrackingError:** a measure of the unexplained portion of performance relative to a benchmark
+- **InformationRatio:** ActivePremium/TrackingError. Information Ratio may be used to rank investments in a relative fashion
+
+### Annualized Returns
+```{r annual-returns, ECHO=FALSE,message=FALSE, warnings=FALSE}
+table <- table.AnnualizedReturns(all.in.one, Rf=risk_free_rate)
+pander(table, style = 'rmarkdown')
+```
+
+### Sharpe ratios
+```{r sharpe, ECHO=FALSE,message=FALSE, warnings=FALSE}
+sharpe_95 <- SharpeRatio(all.in.one, Rf = risk_free_rate, p=.95)
+sharpe_99 <- SharpeRatio(all.in.one, Rf = risk_free_rate, p=.99)
+sharpe <- rbind(sharpe_95,sharpe_99)
+pander(sharpe, style = 'rmarkdown')
+```
+
+<!-- ### To buy -->
+
+<!-- ```{r byu} -->
+<!-- buy<-matrix(0, nrow = length(symbols)+1, ncol = 3) -->
+<!-- row.names(buy)<-c(symbols,"CASH") -->
+<!-- colnames(buy)<-c("Allocation", "Quote", "Shares") -->
+<!-- quotes <- getQuote(symbols) -->
+<!-- buy[1:length(symbols),1] <- round(w, digits = 2) -->
+<!-- buy[1:length(symbols),2] <- quotes$Last -->
+<!-- for(i in 1:length(symbols)){ -->
+<!--   buy[i,3] = ifelse(buy[i,1]==0,0,floor(buy[i,1]*capital/buy[i,2])) -->
+<!-- } -->
+<!-- buy[length(buy[,1]),] <- c(NA,1,round(capital-sum(buy[1:length(symbols),3]*buy[1:length(symbols),2]), digits=2)) -->
+<!-- buy[length(buy[,1]),1] <- buy[length(buy[,1]),3] / capital -->
+<!-- pander(buy, style = 'rmarkdown') -->
+<!-- ``` -->
