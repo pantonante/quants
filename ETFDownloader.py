@@ -5,7 +5,7 @@ import csv
 import json
 
 if __name__ == "__main__":
-    client = MongoClient()
+    client = MongoClient('mongodb://root:example@localhost:27017')
     db = client.etf
     etf_collection = db.details
 
